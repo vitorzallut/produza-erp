@@ -123,10 +123,10 @@ class ContaCreate(BaseModel):
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return pwd_context.hash(password[:72])
 
-def verify_password(password: str, hashed: str) -> bool:
-    return pwd_context.verify(password, hashed)
+def verify_password(password, hashed):
+    return pwd_context.verify(password[:72], hashed)
 
 def create_token(user_id: str, email: str, role: str) -> str:
     payload = {

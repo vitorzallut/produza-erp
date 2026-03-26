@@ -10,7 +10,7 @@ from sqlalchemy.orm import selectinload
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 from datetime import datetime, timezone, timedelta
-from passlib.context import CryptContext
+import bcrypt
 from jose import jwt, JWTError
 import os
 import uuid
@@ -25,19 +25,17 @@ from models import (
     Tarefa, Comentario, Orcamento, ItemOrcamento, Conta, HistoricoCliente,
     UserRole, ProjectStatus, OrcamentoStatus, ContaStatus, ContaTipo, NegociacaoStatus
 )
+
 app = FastAPI(title="Produza ERP API")
 
-# CORS CORRETO
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://produzafilmes.com",
-        "https://www.produzafilmes.com"
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-))
+)
 
 JWT_SECRET = os.environ.get('JWT_SECRET', 'secret-key')
 security = HTTPBearer()
@@ -120,13 +118,11 @@ class ContaCreate(BaseModel):
     observacoes: Optional[str] = None
 
 # Helper functions
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password[:72])
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
-def verify_password(password, hashed):
-    return pwd_context.verify(password[:72], hashed)
+def verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
 
 def create_token(user_id: str, email: str, role: str) -> str:
     payload = {

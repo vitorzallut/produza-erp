@@ -25,17 +25,19 @@ from models import (
     Tarefa, Comentario, Orcamento, ItemOrcamento, Conta, HistoricoCliente,
     UserRole, ProjectStatus, OrcamentoStatus, ContaStatus, ContaTipo, NegociacaoStatus
 )
-
 app = FastAPI(title="Produza ERP API")
 
-# CORS
+# CORS CORRETO
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://produzafilmes.com",
+        "https://www.produzafilmes.com"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)
+))
 
 JWT_SECRET = os.environ.get('JWT_SECRET', 'secret-key')
 security = HTTPBearer()

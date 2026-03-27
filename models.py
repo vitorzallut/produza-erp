@@ -77,6 +77,7 @@ class Empresa(Base):
     orcamentos = relationship("Orcamento", back_populates="empresa")
     contas = relationship("Conta", back_populates="empresa")
     clientes = relationship("Cliente", back_populates="empresa")
+    fornecedores = relationship("Fornecedor", back_populates="empresa")
 
 class Usuario(Base):
     __tablename__ = 'usuarios'
@@ -163,6 +164,7 @@ class Projeto(Base):
     orcamento = relationship("Orcamento", back_populates="projeto")
     colunas = relationship("ColunaKanban", back_populates="projeto", cascade="all, delete-orphan")
     contas = relationship("Conta", back_populates="projeto")
+    itens_fornecedor = relationship("ItemFornecedor", back_populates="projeto")
 
 class ColunaKanban(Base):
     __tablename__ = 'colunas_kanban'
@@ -221,9 +223,34 @@ class Orcamento(Base):
     validade = Column(DateTime(timezone=True))
     condicoes_pagamento = Column(Text)
     observacoes = Column(Text)
+    
+    # Campos de cálculo antigos (mantidos para compatibilidade)
     total_custo = Column(Numeric(12, 2), default=0)
     total_venda = Column(Numeric(12, 2), default=0)
     total_lucro = Column(Numeric(12, 2), default=0)
+    
+    # Novos campos de cálculo - Sistema Jobbs
+    taxa_produtora_percent = Column(Numeric(5, 2), default=0)  # Porcentagem da produtora
+    imposto_percent = Column(Numeric(5, 2), default=0)  # Porcentagem de imposto
+    bv_percent = Column(Numeric(5, 2), default=0)  # BV opcional
+    comissao_percent = Column(Numeric(5, 2), default=0)  # Comissão opcional
+    desconto_valor = Column(Numeric(12, 2), default=0)  # Desconto em valor
+    acrescimo_valor = Column(Numeric(12, 2), default=0)  # Acréscimo em valor
+    
+    # Modos de exibição (visivel, embutido, distribuido)
+    # visivel = aparece separado, embutido = soma no total, distribuido = divide nos itens
+    modo_imposto = Column(String(20), default='visivel')  # visivel, embutido, distribuido
+    modo_produtora = Column(String(20), default='visivel')  # visivel, embutido, distribuido
+    
+    # Totais calculados
+    subtotal_1 = Column(Numeric(12, 2), default=0)  # Soma dos itens
+    valor_produtora = Column(Numeric(12, 2), default=0)  # Valor da taxa produtora
+    subtotal_2 = Column(Numeric(12, 2), default=0)  # Subtotal 1 + Taxa Produtora
+    valor_imposto = Column(Numeric(12, 2), default=0)  # Valor do imposto
+    valor_bv = Column(Numeric(12, 2), default=0)  # Valor do BV
+    valor_comissao = Column(Numeric(12, 2), default=0)  # Valor da comissão
+    total_geral = Column(Numeric(12, 2), default=0)  # Total final
+    
     link_compartilhamento = Column(String(100), unique=True)
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
@@ -232,6 +259,7 @@ class Orcamento(Base):
     cliente = relationship("Cliente", back_populates="orcamentos")
     projeto = relationship("Projeto", back_populates="orcamento", uselist=False)
     itens = relationship("ItemOrcamento", back_populates="orcamento", cascade="all, delete-orphan")
+    contas = relationship("Conta", back_populates="orcamento")
 
 class ItemOrcamento(Base):
     __tablename__ = 'itens_orcamento'
@@ -243,13 +271,72 @@ class ItemOrcamento(Base):
     quantidade = Column(Numeric(10, 2), default=1)
     unidade = Column(String(20), default="un")
     custo_unitario = Column(Numeric(12, 2), default=0)
-    venda_unitario = Column(Numeric(12, 2), default=0)
+    venda_unitario = Column(Numeric(12, 2), default=0)  # Valor base de venda
     custo_total = Column(Numeric(12, 2), default=0)
     venda_total = Column(Numeric(12, 2), default=0)
     lucro = Column(Numeric(12, 2), default=0)
     ordem = Column(Integer, default=0)
     
+    # Valores finais (quando produtora/imposto distribuídos)
+    venda_unitario_final = Column(Numeric(12, 2), default=0)  # Valor unitário com taxas embutidas
+    venda_total_final = Column(Numeric(12, 2), default=0)  # Valor total com taxas embutidas
+    
     orcamento = relationship("Orcamento", back_populates="itens")
+    fornecedores = relationship("ItemFornecedor", back_populates="item_orcamento", cascade="all, delete-orphan")
+
+class ItemFornecedorStatus(str, enum.Enum):
+    PENDENTE = "pendente"
+    CONTRATADO = "contratado"
+    EM_EXECUCAO = "em_execucao"
+    CONCLUIDO = "concluido"
+    CANCELADO = "cancelado"
+
+class Fornecedor(Base):
+    """Cadastro de fornecedores"""
+    __tablename__ = 'fornecedores'
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    empresa_id = Column(String(36), ForeignKey('empresas.id', ondelete='CASCADE'), index=True)
+    tipo = Column(String(2), default="PJ")  # PF ou PJ
+    cpf_cnpj = Column(String(18), index=True)
+    nome = Column(String(255), nullable=False)
+    nome_fantasia = Column(String(255))
+    email = Column(String(255))
+    telefone = Column(String(20))
+    endereco = Column(Text)
+    observacoes = Column(Text)
+    ativo = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    
+    empresa = relationship("Empresa", back_populates="fornecedores")
+    itens_fornecedor = relationship("ItemFornecedor", back_populates="fornecedor")
+
+class ItemFornecedor(Base):
+    """Vínculo entre item do orçamento e fornecedor"""
+    __tablename__ = 'itens_fornecedor'
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    item_orcamento_id = Column(String(36), ForeignKey('itens_orcamento.id', ondelete='CASCADE'), index=True)
+    fornecedor_id = Column(String(36), ForeignKey('fornecedores.id', ondelete='CASCADE'), index=True)
+    projeto_id = Column(String(36), ForeignKey('projetos.id', ondelete='SET NULL'), index=True)
+    
+    descricao = Column(Text)
+    quantidade = Column(Numeric(10, 2), default=1)
+    unidade = Column(String(20), default="un")
+    custo_unitario = Column(Numeric(12, 2), default=0)
+    custo_total = Column(Numeric(12, 2), default=0)
+    prazo = Column(DateTime(timezone=True))
+    observacoes = Column(Text)
+    status = Column(SQLEnum(ItemFornecedorStatus), default=ItemFornecedorStatus.PENDENTE)
+    
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    
+    item_orcamento = relationship("ItemOrcamento", back_populates="fornecedores")
+    fornecedor = relationship("Fornecedor", back_populates="itens_fornecedor")
+    projeto = relationship("Projeto", back_populates="itens_fornecedor")
+    contas = relationship("Conta", back_populates="item_fornecedor")
 
 class Conta(Base):
     __tablename__ = 'contas'
@@ -257,6 +344,8 @@ class Conta(Base):
     id = Column(String(36), primary_key=True, default=generate_uuid)
     empresa_id = Column(String(36), ForeignKey('empresas.id', ondelete='CASCADE'), index=True)
     projeto_id = Column(String(36), ForeignKey('projetos.id', ondelete='SET NULL'), index=True)
+    orcamento_id = Column(String(36), ForeignKey('orcamentos.id', ondelete='SET NULL'), index=True)
+    item_fornecedor_id = Column(String(36), ForeignKey('itens_fornecedor.id', ondelete='SET NULL'), index=True)
     tipo = Column(SQLEnum(ContaTipo), nullable=False, index=True)
     categoria = Column(String(100))
     descricao = Column(Text, nullable=False)
@@ -272,3 +361,5 @@ class Conta(Base):
     
     empresa = relationship("Empresa", back_populates="contas")
     projeto = relationship("Projeto", back_populates="contas")
+    orcamento = relationship("Orcamento", back_populates="contas")
+    item_fornecedor = relationship("ItemFornecedor", back_populates="contas")

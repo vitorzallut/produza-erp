@@ -16,6 +16,8 @@ import os
 import uuid
 from dotenv import load_dotenv
 from pathlib import Path
+import httpx
+import re
 
 load_dotenv(Path(__file__).parent / '.env')
 
@@ -23,7 +25,9 @@ from database import get_db
 from models import (
     Usuario, Empresa, UsuarioEmpresa, Cliente, Projeto, ColunaKanban, 
     Tarefa, Comentario, Orcamento, ItemOrcamento, Conta, HistoricoCliente,
-    UserRole, ProjectStatus, OrcamentoStatus, ContaStatus, ContaTipo, NegociacaoStatus
+    Fornecedor, ItemFornecedor,
+    UserRole, ProjectStatus, OrcamentoStatus, ContaStatus, ContaTipo, NegociacaoStatus,
+    ItemFornecedorStatus
 )
 
 app = FastAPI(title="Produza ERP API")
@@ -97,6 +101,30 @@ class OrcamentoCreate(BaseModel):
     descricao: Optional[str] = None
     validade: Optional[datetime] = None
     condicoes_pagamento: Optional[str] = None
+    taxa_produtora_percent: float = 0
+    imposto_percent: float = 0
+    bv_percent: float = 0
+    comissao_percent: float = 0
+    desconto_valor: float = 0
+    acrescimo_valor: float = 0
+    modo_imposto: str = 'visivel'  # visivel, embutido, distribuido
+    modo_produtora: str = 'visivel'  # visivel, embutido, distribuido
+
+class OrcamentoUpdate(BaseModel):
+    titulo: Optional[str] = None
+    descricao: Optional[str] = None
+    cliente_id: Optional[str] = None
+    validade: Optional[datetime] = None
+    condicoes_pagamento: Optional[str] = None
+    observacoes: Optional[str] = None
+    taxa_produtora_percent: Optional[float] = None
+    imposto_percent: Optional[float] = None
+    bv_percent: Optional[float] = None
+    comissao_percent: Optional[float] = None
+    desconto_valor: Optional[float] = None
+    acrescimo_valor: Optional[float] = None
+    modo_imposto: Optional[str] = None
+    modo_produtora: Optional[str] = None
 
 class ItemOrcamentoCreate(BaseModel):
     categoria: Optional[str] = None
@@ -123,6 +151,113 @@ def hash_password(password: str) -> str:
 
 def verify_password(password: str, hashed: str) -> bool:
     return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+
+def serialize_model(obj):
+    """Serializa um model SQLAlchemy para dict, excluindo relações"""
+    if obj is None:
+        return None
+    result = {}
+    for column in obj.__table__.columns:
+        value = getattr(obj, column.name)
+        if isinstance(value, datetime):
+            result[column.name] = value.isoformat()
+        elif hasattr(value, 'value'):  # Enum
+            result[column.name] = value.value
+        else:
+            result[column.name] = value
+    return result
+
+async def recalcular_orcamento(orcamento, db: AsyncSession):
+    """
+    Recalcula todos os valores do orçamento seguindo a lógica Jobbs:
+    1. Subtotal 1 = soma base dos itens
+    2. Taxa Produtora (%) sobre Subtotal 1
+    3. Subtotal 2 = Subtotal 1 + Taxa Produtora
+    4. Imposto (%) sobre Subtotal 2
+    5. BV (%) opcional
+    6. Comissão (%) opcional
+    7. Desconto / Acréscimo
+    8. Total Geral
+    """
+    from decimal import Decimal
+    
+    # Buscar itens do orçamento
+    result = await db.execute(
+        select(ItemOrcamento).where(ItemOrcamento.orcamento_id == orcamento.id)
+    )
+    itens = result.scalars().all()
+    
+    # Calcular subtotal 1 (soma dos itens - venda base)
+    subtotal_1 = Decimal('0')
+    total_custo = Decimal('0')
+    
+    for item in itens:
+        venda_total = Decimal(str(item.quantidade)) * Decimal(str(item.venda_unitario))
+        custo_total = Decimal(str(item.quantidade)) * Decimal(str(item.custo_unitario))
+        
+        item.venda_total = venda_total
+        item.custo_total = custo_total
+        item.lucro = venda_total - custo_total
+        
+        subtotal_1 += venda_total
+        total_custo += custo_total
+    
+    # Taxas
+    taxa_produtora_percent = Decimal(str(orcamento.taxa_produtora_percent or 0))
+    imposto_percent = Decimal(str(orcamento.imposto_percent or 0))
+    bv_percent = Decimal(str(orcamento.bv_percent or 0))
+    comissao_percent = Decimal(str(orcamento.comissao_percent or 0))
+    desconto = Decimal(str(orcamento.desconto_valor or 0))
+    acrescimo = Decimal(str(orcamento.acrescimo_valor or 0))
+    
+    # Calcular valor da produtora
+    valor_produtora = subtotal_1 * taxa_produtora_percent / Decimal('100')
+    
+    # Subtotal 2
+    subtotal_2 = subtotal_1 + valor_produtora
+    
+    # Calcular imposto sobre subtotal 2
+    valor_imposto = subtotal_2 * imposto_percent / Decimal('100')
+    
+    # BV e Comissão (sobre subtotal 2)
+    valor_bv = subtotal_2 * bv_percent / Decimal('100')
+    valor_comissao = subtotal_2 * comissao_percent / Decimal('100')
+    
+    # Total geral
+    total_geral = subtotal_2 + valor_imposto + valor_bv + valor_comissao - desconto + acrescimo
+    
+    # Calcular valores finais dos itens (quando taxas são distribuídas)
+    modo_produtora = orcamento.modo_produtora or 'visivel'
+    modo_imposto = orcamento.modo_imposto or 'visivel'
+    
+    # Fator de multiplicação para distribuição
+    fator_produtora = Decimal('1') + (taxa_produtora_percent / Decimal('100')) if modo_produtora == 'distribuido' else Decimal('1')
+    fator_imposto = Decimal('1') + (imposto_percent / Decimal('100')) if modo_imposto == 'distribuido' else Decimal('1')
+    fator_total = fator_produtora * fator_imposto
+    
+    for item in itens:
+        venda_unitario_base = Decimal(str(item.venda_unitario))
+        venda_unitario_final = venda_unitario_base * fator_total
+        venda_total_final = Decimal(str(item.quantidade)) * venda_unitario_final
+        
+        item.venda_unitario_final = venda_unitario_final
+        item.venda_total_final = venda_total_final
+    
+    # Atualizar orçamento
+    orcamento.subtotal_1 = subtotal_1
+    orcamento.valor_produtora = valor_produtora
+    orcamento.subtotal_2 = subtotal_2
+    orcamento.valor_imposto = valor_imposto
+    orcamento.valor_bv = valor_bv
+    orcamento.valor_comissao = valor_comissao
+    orcamento.total_geral = total_geral
+    
+    # Campos antigos (compatibilidade)
+    orcamento.total_custo = total_custo
+    orcamento.total_venda = total_geral
+    orcamento.total_lucro = total_geral - total_custo
+    
+    await db.commit()
 
 def create_token(user_id: str, email: str, role: str) -> str:
     payload = {
@@ -275,15 +410,62 @@ async def vincular_usuario_empresa(usuario_id: str, empresa_id: str, user: Usuar
     await db.commit()
     return {"message": "Usuário vinculado à empresa"}
 
+@app.patch("/api/usuarios/{usuario_id}")
+async def update_usuario(usuario_id: str, data: dict, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    check_admin(user)
+    
+    result = await db.execute(select(Usuario).where(Usuario.id == usuario_id))
+    usuario = result.scalar_one_or_none()
+    if not usuario:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    
+    # Atualizar campos básicos
+    if 'nome' in data:
+        usuario.nome = data['nome']
+    if 'email' in data:
+        # Verificar se email já existe em outro usuário
+        if data['email'] != usuario.email:
+            check_email = await db.execute(select(Usuario).where(Usuario.email == data['email']))
+            if check_email.scalar_one_or_none():
+                raise HTTPException(status_code=400, detail="Email já em uso")
+        usuario.email = data['email']
+    if 'senha' in data and data['senha']:
+        usuario.senha_hash = hash_password(data['senha'])
+    if 'role' in data:
+        usuario.role = UserRole(data['role'])
+    if 'ativo' in data:
+        usuario.ativo = data['ativo']
+    if 'telefone' in data:
+        usuario.telefone = data['telefone']
+    
+    # Atualizar vínculos de empresas se fornecido
+    if 'empresa_ids' in data:
+        # Remover vínculos antigos
+        await db.execute(
+            select(UsuarioEmpresa).where(UsuarioEmpresa.usuario_id == usuario_id)
+        )
+        result = await db.execute(select(UsuarioEmpresa).where(UsuarioEmpresa.usuario_id == usuario_id))
+        vinculos_antigos = result.scalars().all()
+        for v in vinculos_antigos:
+            await db.delete(v)
+        
+        # Criar novos vínculos
+        for emp_id in data['empresa_ids']:
+            novo_vinculo = UsuarioEmpresa(usuario_id=usuario_id, empresa_id=emp_id)
+            db.add(novo_vinculo)
+    
+    await db.commit()
+    return {"message": "Usuário atualizado", "id": usuario.id}
+
 # Empresas
 @app.get("/api/empresas")
 async def list_empresas(user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     if user.role == UserRole.ADMIN:
-        result = await db.execute(select(Empresa).where(Empresa.ativa == True).order_by(Empresa.razao_social))
+        result = await db.execute(select(Empresa).where(Empresa.ativa.is_(True)).order_by(Empresa.razao_social))
         empresas = result.scalars().all()
     else:
         empresa_ids = [ue.empresa_id for ue in user.empresas]
-        result = await db.execute(select(Empresa).where(Empresa.id.in_(empresa_ids), Empresa.ativa == True))
+        result = await db.execute(select(Empresa).where(Empresa.id.in_(empresa_ids), Empresa.ativa.is_(True)))
         empresas = result.scalars().all()
     
     return [
@@ -321,6 +503,97 @@ async def get_empresa(empresa_id: str, user: Usuario = Depends(get_current_user)
     if not empresa:
         raise HTTPException(status_code=404, detail="Empresa não encontrada")
     return empresa
+
+@app.patch("/api/empresas/{empresa_id}")
+async def update_empresa(empresa_id: str, data: dict, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    check_admin(user)
+    result = await db.execute(select(Empresa).where(Empresa.id == empresa_id))
+    empresa = result.scalar_one_or_none()
+    if not empresa:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
+    
+    allowed_fields = ['razao_social', 'nome_fantasia', 'cnpj', 'email', 'telefone', 'endereco', 'logo_url', 'cor_primaria']
+    for key, value in data.items():
+        if key in allowed_fields and hasattr(empresa, key):
+            setattr(empresa, key, value)
+    
+    await db.commit()
+    return {"message": "Empresa atualizada", "id": empresa.id}
+
+# Consulta CNPJ via BrasilAPI
+@app.get("/api/consulta-cnpj/{cnpj}")
+async def consulta_cnpj(cnpj: str, user: Usuario = Depends(get_current_user)):
+    """Consulta dados de CNPJ via BrasilAPI (Receita Federal)"""
+    # Limpar CNPJ - remover caracteres especiais
+    cnpj_limpo = re.sub(r'[^0-9]', '', cnpj)
+    
+    if len(cnpj_limpo) != 14:
+        raise HTTPException(status_code=400, detail="CNPJ inválido. Deve conter 14 dígitos.")
+    
+    # Validação básica de CNPJ
+    if not validar_cnpj(cnpj_limpo):
+        raise HTTPException(status_code=400, detail="CNPJ inválido (dígitos verificadores incorretos).")
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(f"https://brasilapi.com.br/api/cnpj/v1/{cnpj_limpo}")
+            
+            if response.status_code == 404:
+                raise HTTPException(status_code=404, detail="CNPJ não encontrado na base da Receita Federal")
+            
+            if response.status_code != 200:
+                raise HTTPException(status_code=502, detail="Erro ao consultar API externa")
+            
+            dados = response.json()
+            
+            # Formatar resposta padronizada
+            return {
+                "cnpj": dados.get("cnpj", ""),
+                "razao_social": dados.get("razao_social", ""),
+                "nome_fantasia": dados.get("nome_fantasia", ""),
+                "situacao_cadastral": dados.get("descricao_situacao_cadastral", ""),
+                "data_abertura": dados.get("data_inicio_atividade", ""),
+                "natureza_juridica": dados.get("natureza_juridica", ""),
+                "cnae_principal": {
+                    "codigo": dados.get("cnae_fiscal", ""),
+                    "descricao": dados.get("cnae_fiscal_descricao", "")
+                },
+                "endereco": {
+                    "logradouro": dados.get("logradouro", ""),
+                    "numero": dados.get("numero", ""),
+                    "complemento": dados.get("complemento", ""),
+                    "bairro": dados.get("bairro", ""),
+                    "cidade": dados.get("municipio", ""),
+                    "uf": dados.get("uf", ""),
+                    "cep": dados.get("cep", "")
+                },
+                "telefone": dados.get("ddd_telefone_1", ""),
+                "email": dados.get("email", ""),
+                "porte": dados.get("porte", ""),
+                "capital_social": dados.get("capital_social", 0)
+            }
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Timeout ao consultar API. Tente novamente.")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Erro de conexão com API externa: {str(e)}")
+
+def validar_cnpj(cnpj: str) -> bool:
+    """Valida os dígitos verificadores do CNPJ"""
+    if len(cnpj) != 14 or cnpj == cnpj[0] * 14:
+        return False
+    
+    def calc_digito(cnpj, pesos):
+        soma = sum(int(c) * p for c, p in zip(cnpj, pesos))
+        resto = soma % 11
+        return '0' if resto < 2 else str(11 - resto)
+    
+    pesos1 = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+    pesos2 = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+    
+    d1 = calc_digito(cnpj[:12], pesos1)
+    d2 = calc_digito(cnpj[:12] + d1, pesos2)
+    
+    return cnpj[-2:] == d1 + d2
 
 # Clientes
 @app.get("/api/clientes")
@@ -598,9 +871,27 @@ async def get_orcamento(orcamento_id: str, user: Usuario = Depends(get_current_u
         "validade": orcamento.validade.isoformat() if orcamento.validade else None,
         "condicoes_pagamento": orcamento.condicoes_pagamento,
         "observacoes": orcamento.observacoes,
-        "total_custo": float(orcamento.total_custo),
-        "total_venda": float(orcamento.total_venda),
-        "total_lucro": float(orcamento.total_lucro),
+        # Taxas e configurações
+        "taxa_produtora_percent": float(orcamento.taxa_produtora_percent or 0),
+        "imposto_percent": float(orcamento.imposto_percent or 0),
+        "bv_percent": float(orcamento.bv_percent or 0),
+        "comissao_percent": float(orcamento.comissao_percent or 0),
+        "desconto_valor": float(orcamento.desconto_valor or 0),
+        "acrescimo_valor": float(orcamento.acrescimo_valor or 0),
+        "modo_imposto": orcamento.modo_imposto or 'visivel',
+        "modo_produtora": orcamento.modo_produtora or 'visivel',
+        # Totais calculados
+        "subtotal_1": float(orcamento.subtotal_1 or 0),
+        "valor_produtora": float(orcamento.valor_produtora or 0),
+        "subtotal_2": float(orcamento.subtotal_2 or 0),
+        "valor_imposto": float(orcamento.valor_imposto or 0),
+        "valor_bv": float(orcamento.valor_bv or 0),
+        "valor_comissao": float(orcamento.valor_comissao or 0),
+        "total_geral": float(orcamento.total_geral or 0),
+        # Campos antigos (compatibilidade)
+        "total_custo": float(orcamento.total_custo or 0),
+        "total_venda": float(orcamento.total_venda or 0),
+        "total_lucro": float(orcamento.total_lucro or 0),
         "link_compartilhamento": orcamento.link_compartilhamento,
         "itens": [
             {
@@ -614,21 +905,50 @@ async def get_orcamento(orcamento_id: str, user: Usuario = Depends(get_current_u
                 "custo_total": float(i.custo_total),
                 "venda_total": float(i.venda_total),
                 "lucro": float(i.lucro),
+                "venda_unitario_final": float(i.venda_unitario_final or i.venda_unitario),
+                "venda_total_final": float(i.venda_total_final or i.venda_total),
                 "ordem": i.ordem
             }
             for i in sorted(orcamento.itens, key=lambda x: x.ordem)
         ]
     }
 
+@app.patch("/api/orcamentos/{orcamento_id}")
+async def update_orcamento(orcamento_id: str, data: OrcamentoUpdate, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Orcamento).where(Orcamento.id == orcamento_id))
+    orcamento = result.scalar_one_or_none()
+    if not orcamento:
+        raise HTTPException(status_code=404, detail="Orçamento não encontrado")
+    
+    check_empresa_access(user, orcamento.empresa_id)
+    
+    # Atualizar campos
+    update_data = data.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(orcamento, key, value)
+    
+    # Recalcular totais
+    await recalcular_orcamento(orcamento, db)
+    
+    return {"message": "Orçamento atualizado", "id": orcamento.id}
+
 @app.post("/api/orcamentos/{orcamento_id}/itens")
 async def add_item_orcamento(orcamento_id: str, data: ItemOrcamentoCreate, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    # Buscar orçamento
+    result = await db.execute(select(Orcamento).where(Orcamento.id == orcamento_id))
+    orcamento = result.scalar_one_or_none()
+    if not orcamento:
+        raise HTTPException(status_code=404, detail="Orçamento não encontrado")
+    
+    check_empresa_access(user, orcamento.empresa_id)
+    
     # Get max ordem
     result = await db.execute(
         select(func.max(ItemOrcamento.ordem)).where(ItemOrcamento.orcamento_id == orcamento_id)
     )
     max_ordem = result.scalar() or 0
     
-    # Calcular totais
+    # Calcular totais do item
     custo_total = data.quantidade * data.custo_unitario
     venda_total = data.quantidade * data.venda_unitario
     lucro = venda_total - custo_total
@@ -639,18 +959,18 @@ async def add_item_orcamento(orcamento_id: str, data: ItemOrcamentoCreate, user:
         custo_total=custo_total,
         venda_total=venda_total,
         lucro=lucro,
+        venda_unitario_final=data.venda_unitario,
+        venda_total_final=venda_total,
         ordem=max_ordem + 1
     )
     db.add(item)
+    await db.commit()
     
-    # Atualizar totais do orçamento
+    # Recalcular totais do orçamento
     result = await db.execute(select(Orcamento).where(Orcamento.id == orcamento_id))
     orcamento = result.scalar_one()
-    orcamento.total_custo = float(orcamento.total_custo) + custo_total
-    orcamento.total_venda = float(orcamento.total_venda) + venda_total
-    orcamento.total_lucro = float(orcamento.total_lucro) + lucro
+    await recalcular_orcamento(orcamento, db)
     
-    await db.commit()
     await db.refresh(item)
     return {"id": item.id}
 
@@ -661,15 +981,14 @@ async def delete_item_orcamento(orcamento_id: str, item_id: str, user: Usuario =
     if not item:
         raise HTTPException(status_code=404, detail="Item não encontrado")
     
-    # Atualizar totais do orçamento
-    result = await db.execute(select(Orcamento).where(Orcamento.id == orcamento_id))
-    orcamento = result.scalar_one()
-    orcamento.total_custo = float(orcamento.total_custo) - float(item.custo_total)
-    orcamento.total_venda = float(orcamento.total_venda) - float(item.venda_total)
-    orcamento.total_lucro = float(orcamento.total_lucro) - float(item.lucro)
-    
     await db.delete(item)
     await db.commit()
+    
+    # Recalcular totais do orçamento
+    result = await db.execute(select(Orcamento).where(Orcamento.id == orcamento_id))
+    orcamento = result.scalar_one()
+    await recalcular_orcamento(orcamento, db)
+    
     return {"message": "Item excluído"}
 
 # Aprovar orçamento e criar projeto automaticamente
@@ -956,3 +1275,317 @@ async def setup(db: AsyncSession = Depends(get_db)):
     await db.refresh(admin)
     
     return {"message": "Admin criado com sucesso", "email": admin.email}
+
+
+
+# =============================================================================
+# FORNECEDORES
+# =============================================================================
+
+@app.get("/api/fornecedores")
+async def list_fornecedores(empresa_id: str, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Fornecedor)
+        .where(Fornecedor.empresa_id == empresa_id, Fornecedor.ativo.is_(True))
+        .order_by(Fornecedor.nome)
+    )
+    fornecedores = result.scalars().all()
+    return [serialize_model(f) for f in fornecedores]
+
+@app.get("/api/fornecedores/{fornecedor_id}")
+async def get_fornecedor(fornecedor_id: str, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Fornecedor).where(Fornecedor.id == fornecedor_id))
+    fornecedor = result.scalar_one_or_none()
+    if not fornecedor:
+        raise HTTPException(status_code=404, detail="Fornecedor não encontrado")
+    return serialize_model(fornecedor)
+
+@app.post("/api/fornecedores")
+async def create_fornecedor(data: dict, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    fornecedor = Fornecedor(
+        empresa_id=data.get('empresa_id'),
+        tipo=data.get('tipo', 'PJ'),
+        cpf_cnpj=data.get('cpf_cnpj'),
+        nome=data.get('nome'),
+        nome_fantasia=data.get('nome_fantasia'),
+        email=data.get('email'),
+        telefone=data.get('telefone'),
+        endereco=data.get('endereco'),
+        observacoes=data.get('observacoes'),
+        ativo=True
+    )
+    db.add(fornecedor)
+    await db.commit()
+    await db.refresh(fornecedor)
+    return serialize_model(fornecedor)
+
+@app.patch("/api/fornecedores/{fornecedor_id}")
+async def update_fornecedor(fornecedor_id: str, data: dict, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Fornecedor).where(Fornecedor.id == fornecedor_id))
+    fornecedor = result.scalar_one_or_none()
+    if not fornecedor:
+        raise HTTPException(status_code=404, detail="Fornecedor não encontrado")
+    
+    campos = ['tipo', 'cpf_cnpj', 'nome', 'nome_fantasia', 'email', 'telefone', 'endereco', 'observacoes', 'ativo']
+    for campo in campos:
+        if campo in data:
+            setattr(fornecedor, campo, data[campo])
+    
+    await db.commit()
+    return {"message": "Fornecedor atualizado", "id": fornecedor.id}
+
+@app.delete("/api/fornecedores/{fornecedor_id}")
+async def delete_fornecedor(fornecedor_id: str, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Exclusão lógica - apenas desativa o fornecedor"""
+    result = await db.execute(select(Fornecedor).where(Fornecedor.id == fornecedor_id))
+    fornecedor = result.scalar_one_or_none()
+    if not fornecedor:
+        raise HTTPException(status_code=404, detail="Fornecedor não encontrado")
+    
+    fornecedor.ativo = False
+    await db.commit()
+    return {"message": "Fornecedor desativado"}
+
+# =============================================================================
+# ITENS FORNECEDOR (vínculo item orçamento <-> fornecedor)
+# =============================================================================
+
+@app.get("/api/itens-fornecedor")
+async def list_itens_fornecedor(
+    item_orcamento_id: str = None, 
+    projeto_id: str = None,
+    user: Usuario = Depends(get_current_user), 
+    db: AsyncSession = Depends(get_db)
+):
+    query = select(ItemFornecedor).options(
+        selectinload(ItemFornecedor.fornecedor),
+        selectinload(ItemFornecedor.item_orcamento)
+    )
+    
+    if item_orcamento_id:
+        query = query.where(ItemFornecedor.item_orcamento_id == item_orcamento_id)
+    if projeto_id:
+        query = query.where(ItemFornecedor.projeto_id == projeto_id)
+    
+    result = await db.execute(query)
+    itens = result.scalars().all()
+    
+    return [{
+        **serialize_model(item),
+        "fornecedor": serialize_model(item.fornecedor) if item.fornecedor else None,
+        "item_orcamento": serialize_model(item.item_orcamento) if item.item_orcamento else None
+    } for item in itens]
+
+@app.post("/api/itens-fornecedor")
+async def create_item_fornecedor(data: dict, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Vincular fornecedor a um item do orçamento"""
+    quantidade = float(data.get('quantidade', 1))
+    custo_unitario = float(data.get('custo_unitario', 0))
+    custo_total = quantidade * custo_unitario
+    
+    item_fornecedor = ItemFornecedor(
+        item_orcamento_id=data.get('item_orcamento_id'),
+        fornecedor_id=data.get('fornecedor_id'),
+        projeto_id=data.get('projeto_id'),
+        descricao=data.get('descricao'),
+        quantidade=quantidade,
+        unidade=data.get('unidade', 'un'),
+        custo_unitario=custo_unitario,
+        custo_total=custo_total,
+        prazo=datetime.fromisoformat(data['prazo'].replace('Z', '+00:00')) if data.get('prazo') else None,
+        observacoes=data.get('observacoes'),
+        status=ItemFornecedorStatus(data.get('status', 'pendente').upper())
+    )
+    db.add(item_fornecedor)
+    await db.commit()
+    await db.refresh(item_fornecedor)
+    return serialize_model(item_fornecedor)
+
+@app.patch("/api/itens-fornecedor/{item_id}")
+async def update_item_fornecedor(item_id: str, data: dict, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(ItemFornecedor).where(ItemFornecedor.id == item_id))
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item não encontrado")
+    
+    campos = ['descricao', 'quantidade', 'unidade', 'custo_unitario', 'observacoes']
+    for campo in campos:
+        if campo in data:
+            setattr(item, campo, data[campo])
+    
+    if 'status' in data:
+        item.status = ItemFornecedorStatus(data['status'].upper())
+    if 'prazo' in data and data['prazo']:
+        item.prazo = datetime.fromisoformat(data['prazo'].replace('Z', '+00:00'))
+    
+    # Recalcular custo total
+    item.custo_total = float(item.quantidade) * float(item.custo_unitario)
+    
+    await db.commit()
+    return {"message": "Item atualizado", "id": item.id}
+
+@app.delete("/api/itens-fornecedor/{item_id}")
+async def delete_item_fornecedor(item_id: str, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(ItemFornecedor).where(ItemFornecedor.id == item_id))
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item não encontrado")
+    
+    await db.delete(item)
+    await db.commit()
+    return {"message": "Item removido"}
+
+# =============================================================================
+# GERAR CONTA A PAGAR A PARTIR DE FORNECEDOR
+# =============================================================================
+
+@app.post("/api/itens-fornecedor/{item_id}/gerar-conta")
+async def gerar_conta_fornecedor(item_id: str, data: dict, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Gerar conta a pagar a partir de um item de fornecedor"""
+    result = await db.execute(
+        select(ItemFornecedor)
+        .options(selectinload(ItemFornecedor.fornecedor), selectinload(ItemFornecedor.item_orcamento))
+        .where(ItemFornecedor.id == item_id)
+    )
+    item = result.scalar_one_or_none()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item não encontrado")
+    
+    # Buscar dados do orçamento para pegar empresa_id
+    orcamento = None
+    if item.item_orcamento:
+        orc_result = await db.execute(select(Orcamento).where(Orcamento.id == item.item_orcamento.orcamento_id))
+        orcamento = orc_result.scalar_one_or_none()
+    
+    empresa_id = data.get('empresa_id')
+    if not empresa_id and orcamento:
+        empresa_id = orcamento.empresa_id
+    
+    conta = Conta(
+        empresa_id=empresa_id,
+        projeto_id=item.projeto_id,
+        orcamento_id=orcamento.id if orcamento else None,
+        item_fornecedor_id=item.id,
+        tipo=ContaTipo.PAGAR,
+        categoria='Fornecedor',
+        descricao=f"Pagamento fornecedor: {item.fornecedor.nome if item.fornecedor else 'N/A'} - {item.descricao or 'Item'}",
+        valor=float(item.custo_total),
+        data_vencimento=datetime.fromisoformat(data['data_vencimento'].replace('Z', '+00:00')) if data.get('data_vencimento') else item.prazo,
+        status=ContaStatus.PENDENTE,
+        forma_pagamento=data.get('forma_pagamento'),
+        observacoes=data.get('observacoes')
+    )
+    db.add(conta)
+    await db.commit()
+    await db.refresh(conta)
+    return serialize_model(conta)
+
+# =============================================================================
+# EXCLUSÃO DE ORÇAMENTOS E PROJETOS
+# =============================================================================
+
+@app.delete("/api/orcamentos/{orcamento_id}")
+async def delete_orcamento(orcamento_id: str, force: bool = False, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Excluir orçamento. Se tiver projeto vinculado, precisa de force=true"""
+    result = await db.execute(
+        select(Orcamento).options(selectinload(Orcamento.projeto)).where(Orcamento.id == orcamento_id)
+    )
+    orcamento = result.scalar_one_or_none()
+    if not orcamento:
+        raise HTTPException(status_code=404, detail="Orçamento não encontrado")
+    
+    # Verificar se tem projeto vinculado
+    if orcamento.projeto and not force:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Este orçamento está vinculado ao projeto '{orcamento.projeto.titulo}'. Use force=true para confirmar a exclusão."
+        )
+    
+    # Excluir itens e orçamento
+    await db.delete(orcamento)
+    await db.commit()
+    return {"message": "Orçamento excluído com sucesso"}
+
+@app.delete("/api/projetos/{projeto_id}")
+async def delete_projeto(projeto_id: str, archive: bool = True, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Excluir ou arquivar projeto. Por padrão, arquiva (exclusão lógica)"""
+    result = await db.execute(
+        select(Projeto)
+        .options(selectinload(Projeto.colunas), selectinload(Projeto.contas))
+        .where(Projeto.id == projeto_id)
+    )
+    projeto = result.scalar_one_or_none()
+    if not projeto:
+        raise HTTPException(status_code=404, detail="Projeto não encontrado")
+    
+    if archive:
+        # Exclusão lógica - marca como cancelado
+        projeto.status = ProjectStatus.CANCELADO
+        await db.commit()
+        return {"message": "Projeto arquivado (cancelado)", "id": projeto.id}
+    else:
+        # Exclusão física (cascata deleta colunas, tarefas, etc)
+        await db.delete(projeto)
+        await db.commit()
+        return {"message": "Projeto excluído permanentemente"}
+
+# =============================================================================
+# MARGEM E ANÁLISE DO PROJETO
+# =============================================================================
+
+@app.get("/api/projetos/{projeto_id}/margem")
+async def get_margem_projeto(projeto_id: str, user: Usuario = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Calcular margem real do projeto: valor vendido vs custo com fornecedores"""
+    result = await db.execute(
+        select(Projeto).options(selectinload(Projeto.orcamento)).where(Projeto.id == projeto_id)
+    )
+    projeto = result.scalar_one_or_none()
+    if not projeto:
+        raise HTTPException(status_code=404, detail="Projeto não encontrado")
+    
+    valor_vendido = float(projeto.valor_total or 0)
+    
+    # Buscar custos com fornecedores
+    result = await db.execute(
+        select(func.sum(ItemFornecedor.custo_total))
+        .where(ItemFornecedor.projeto_id == projeto_id)
+    )
+    custo_fornecedores = float(result.scalar() or 0)
+    
+    # Buscar itens do orçamento com fornecedores
+    itens_analise = []
+    if projeto.orcamento:
+        result = await db.execute(
+            select(ItemOrcamento)
+            .options(selectinload(ItemOrcamento.fornecedores))
+            .where(ItemOrcamento.orcamento_id == projeto.orcamento.id)
+        )
+        itens = result.scalars().all()
+        
+        for item in itens:
+            custo_item = sum(float(f.custo_total or 0) for f in item.fornecedores)
+            venda_item = float(item.venda_total_final or item.venda_total or 0)
+            margem_item = venda_item - custo_item
+            
+            itens_analise.append({
+                "id": item.id,
+                "descricao": item.descricao,
+                "valor_vendido": venda_item,
+                "custo_fornecedores": custo_item,
+                "margem": margem_item,
+                "margem_percent": (margem_item / venda_item * 100) if venda_item > 0 else 0,
+                "qtd_fornecedores": len(item.fornecedores)
+            })
+    
+    margem_total = valor_vendido - custo_fornecedores
+    margem_percent = (margem_total / valor_vendido * 100) if valor_vendido > 0 else 0
+    
+    return {
+        "projeto_id": projeto_id,
+        "titulo": projeto.titulo,
+        "valor_vendido": valor_vendido,
+        "custo_fornecedores": custo_fornecedores,
+        "margem_total": margem_total,
+        "margem_percent": round(margem_percent, 2),
+        "itens": itens_analise
+    }

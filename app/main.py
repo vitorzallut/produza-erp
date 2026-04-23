@@ -48,6 +48,12 @@ app.include_router(budget_router.router, prefix="/budgets", tags=["Budgets"])
 app.include_router(project_router.router, prefix="/projects", tags=["Projects"])
 app.include_router(financial_router.router, prefix="/financial", tags=["Financial"])
 
+from fastapi.responses import Response
+
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str):
+    return Response(status_code=200)
+
 @app.get("/")
 async def root():
     return {"message": "ERP Backend is running!"}

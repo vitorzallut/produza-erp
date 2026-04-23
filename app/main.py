@@ -26,9 +26,10 @@ app = FastAPI(
 
 # Configuração do CORS
 origins = [
-    os.getenv("FRONTEND_URL"), # URL do seu frontend no Netlify
-    "http://localhost:3000",  # Para desenvolvimento local do frontend
-    "http://localhost:8000",  # Para desenvolvimento local do backend
+    "https://produzafilmes.netlify.app",
+    "https://produzafilmes.com",
+    "https://www.produzafilmes.com",
+    "http://localhost:3000",
 ]
 
 app.add_middleware(

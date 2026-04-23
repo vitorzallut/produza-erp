@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,12 +47,6 @@ app.include_router(budget_router.router, prefix="/budgets", tags=["Budgets"])
 app.include_router(project_router.router, prefix="/projects", tags=["Projects"])
 app.include_router(financial_router.router, prefix="/financial", tags=["Financial"])
 
-from fastapi.responses import Response
-
-@app.options("/{rest_of_path:path}")
-async def preflight_handler(rest_of_path: str):
-    return Response(status_code=200)
-
 @app.get("/")
 async def root():
     return {"message": "ERP Backend is running!"}
@@ -62,7 +55,6 @@ async def root():
 @app.on_event("startup")
 def create_initial_data():
     db = next(get_db())
-    # Verifica se já existe um usuário admin
     admin_user = db.query(models.User).filter(models.User.email == os.getenv("ADMIN_EMAIL")).first()
     if not admin_user:
         print("Criando usuário admin inicial...")
@@ -78,7 +70,6 @@ def create_initial_data():
         db.refresh(admin_user)
         print(f"Usuário admin {admin_user.email} criado.")
 
-        # Cria uma empresa de teste vinculada ao admin
         test_company = db.query(models.Company).filter(models.Company.cnpj == "00.000.000/0001-00").first()
         if not test_company:
             print("Criando empresa de teste inicial...")
@@ -95,7 +86,6 @@ def create_initial_data():
             db.refresh(test_company)
             print(f"Empresa de teste {test_company.nome} criada.")
 
-            # Vincula o admin à empresa de teste
             user_company = models.UserCompany(
                 user_id=admin_user.id,
                 company_id=test_company.id
